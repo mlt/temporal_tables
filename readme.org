@@ -1,0 +1,5 @@
+Want versioning for your tables? Use [[https://github.com/xocolatl/periods][periods]]! That is an active pilot
+project aiming to implement SQL:2016 within PostgreSQL core.
+
+Stuck with a legacy project and want *temporal_tables* extension? It
+is [[https://github.com/mlt/temporal_tables/tree/mlt][here]].
