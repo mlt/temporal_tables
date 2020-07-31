@@ -12,11 +12,7 @@
 #include <float.h>
 
 #if PG_VERSION_NUM >= 120000
-#include "access/relation.h"
 #include "access/table.h"
-#endif
-#if PG_VERSION_NUM >= 90300
-#include "access/htup_details.h"
 #endif
 #include "access/xact.h"
 #include "catalog/namespace.h"
@@ -621,7 +617,7 @@ insert_history_row(HeapTuple tuple,
 	/* Open the history relation and obtain AccessShareLock on it. */
 	relrv = makeRangeVarFromNameList(stringToQualifiedNameList(history_relation_name));
 
-	history_relation = heap_openrv(relrv, AccessShareLock);
+	history_relation = table_openrv(relrv, AccessShareLock);
 
 	/* Look up the cached data for the versioned relation OID. */
 	hash_entry = lookup_versioning_hash_entry(RelationGetRelid(relation),
@@ -734,7 +730,7 @@ insert_history_row(HeapTuple tuple,
 	}
 
 	/* Close the history relation. */
-	relation_close(history_relation, AccessShareLock);
+	table_close(history_relation, AccessShareLock);
 
 	if ((ret = SPI_finish()) != SPI_OK_FINISH)
 		elog(ERROR, "SPI_finish returned %d", ret);
