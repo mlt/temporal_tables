@@ -1,11 +1,3 @@
-CREATE TABLE invalid_system_period (sys_period bigint);
-
-CREATE TRIGGER versioning_trigger
-BEFORE INSERT OR UPDATE OR DELETE ON invalid_system_period
-FOR EACH ROW EXECUTE PROCEDURE versioning('sys_period', NULL, NULL);
-
-INSERT INTO invalid_system_period DEFAULT VALUES;
-
 CREATE TABLE invalid_system_period2 (sys_period tstzrange);
 
 ALTER TABLE invalid_system_period2 DROP COLUMN sys_period;

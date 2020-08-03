@@ -30,6 +30,14 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
+#include "access/genam.h"
+#include "catalog/pg_depend.h"
+#include "catalog/indexing.h"
+#include "catalog/dependency.h"
+#include "utils/fmgroids.h"
+#include "server/commands/sequence.h"
+#include "optimizer/optimizer.h"
+#include "executor/executor.h"
 
 #include "temporal_tables.h"
 
@@ -146,6 +154,11 @@ static Datum versioning_update(TriggerData *trigdata,
 							   const char *period_attname,
 							   const char *history_relation_argument,
 							   const char *adjust_argument);
+
+static Datum versioning_update_plain(TriggerData* trigdata,
+									 int period_attnum,
+									 const char* period_attname,
+									 const char* history_relation_argument);
 
 static Datum versioning_delete(TriggerData *trigdata,
 							   TypeCacheEntry *typcache,
@@ -274,11 +287,22 @@ versioning(PG_FUNCTION_ARGS)
 	typcache = get_period_typcache(fcinfo, period_attr, relation);
 
 	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
-		return versioning_insert(trigdata, typcache, period_attnum);
-	else if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-		return versioning_update(trigdata, typcache,
-								 period_attnum, period_attname,
-								 args[1], args[2]);
+		if (typcache->typtype == TYPTYPE_RANGE)
+			return versioning_insert(trigdata, typcache, period_attnum);
+		else
+			return PointerGetDatum(trigdata->tg_trigtuple);
+	else if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event)) {
+		/* Ignore tuples modified in this transaction. */
+		if (modified_in_current_transaction(trigdata->tg_trigtuple))
+			return PointerGetDatum(trigdata->tg_newtuple);
+
+		if (typcache->typtype == TYPTYPE_RANGE)
+			return versioning_update(trigdata, typcache,
+									 period_attnum, period_attname,
+									 args[1], args[2]);
+		else
+			return versioning_update_plain(trigdata, period_attnum, period_attname, args[1]);
+	}
 	else
 		/* otherwise this is ON DELETE trigger */
 		return versioning_delete(trigdata, typcache,
@@ -381,25 +405,22 @@ get_period_typcache(FunctionCallInfo fcinfo,
 	type = (Form_pg_type) GETSTRUCT(type_tuple);
 
 	/* Check that type is a range. */
-	if (type->typtype != TYPTYPE_RANGE)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("system period column \"%s\" of relation \"%s\" is not a range but type %s",
-						NameStr(attr->attname),
-						RelationGetRelationName(relation),
-						format_type_be(typoid))));
+	if (type->typtype == TYPTYPE_RANGE) {
+		/* Get cached information about the range type. */
+		typcache = range_get_typcache(fcinfo, typoid);
 
-	/* Get cached information about the range type. */
-	typcache = range_get_typcache(fcinfo, typoid);
-
-	/* Check that this is a range of timestamp with timezone. */
-	if (typcache->rngelemtype->type_id != TIMESTAMPTZOID)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("system period column \"%s\" of relation \"%s\" is not a range of timestamp with timezone but of type %s",
-						NameStr(attr->attname),
-						RelationGetRelationName(relation),
-						format_type_be(typcache->rngelemtype->type_id))));
+		/* Check that this is a range of timestamp with timezone. */
+		if (typcache->rngelemtype->type_id != TIMESTAMPTZOID)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("system period column \"%s\" of relation \"%s\" is not a range of timestamp with timezone but of type %s",
+							NameStr(attr->attname),
+							RelationGetRelationName(relation),
+							format_type_be(typcache->rngelemtype->type_id))));
+	}
+	else {
+		typcache = lookup_type_cache(typoid, 0);
+	}
 
 	ReleaseSysCache(type_tuple);
 
@@ -950,11 +971,6 @@ versioning_update(TriggerData *trigdata,
 	HeapTuple		 history_tuple;
 
 	tuple = trigdata->tg_trigtuple;
-
-	/* Ignore tuples modified in this transaction. */
-	if (modified_in_current_transaction(tuple))
-		return PointerGetDatum(trigdata->tg_newtuple);
-
 	relation = trigdata->tg_relation;
 
 	deserialize_system_period(tuple, relation, period_attnum, period_attname,
@@ -988,6 +1004,130 @@ versioning_update(TriggerData *trigdata,
 	return PointerGetDatum(modify_tuple(relation, trigdata->tg_newtuple, period_attnum, range));
 }
 
+/* from StoreAttrDefault in catalog/heap.c */
+static Datum
+find_def(Relation r, int attnum) {
+	Expr*			expr;
+	TupleDesc		tupdesc;
+	ExprState*		exprState;
+	EState*			estate = NULL;
+	ExprContext*	econtext;
+	Datum			missingval = (Datum)0;
+	bool			missingIsNull = true;
+
+	tupdesc = RelationGetDescr(r);
+	for (int i = 0; i < tupdesc->constr->num_defval; i++) {
+		if (attnum == tupdesc->constr->defval[i].adnum) {
+			expr = stringToNode(tupdesc->constr->defval[i].adbin);
+			expr = expression_planner(expr);
+			estate = CreateExecutorState();
+			exprState = ExecPrepareExpr(expr, estate);
+			econtext = GetPerTupleExprContext(estate);
+
+			missingval = ExecEvalExpr(exprState, econtext,
+				&missingIsNull);
+
+			FreeExecutorState(estate);
+
+			break;
+		}
+
+	}
+
+	return missingval;
+}
+
+/* from pg_get_serial_sequence */
+static Oid
+find_seq(Relation r, int attnum) {
+	ScanKeyData	key[3];
+	SysScanDesc	scan;
+	HeapTuple	tup;
+	Relation	depRel;
+	Oid			sequenceId = InvalidOid;
+
+	/* Search the dependency table for the dependent sequence */
+	depRel = table_open(DependRelationId, AccessShareLock);
+	ScanKeyInit(&key[0],
+		Anum_pg_depend_refclassid,
+		BTEqualStrategyNumber, F_OIDEQ,
+		ObjectIdGetDatum(RelationRelationId));
+	ScanKeyInit(&key[1],
+		Anum_pg_depend_refobjid,
+		BTEqualStrategyNumber, F_OIDEQ,
+		ObjectIdGetDatum(r->rd_rel->oid));
+	ScanKeyInit(&key[2],
+		Anum_pg_depend_refobjsubid,
+		BTEqualStrategyNumber, F_INT4EQ,
+		Int32GetDatum(attnum));
+
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true,
+		NULL, 3, key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_depend deprec = (Form_pg_depend)GETSTRUCT(tup);
+
+		/*
+		 * Look for an auto dependency (serial column) or internal dependency
+		 * (identity column) of a sequence on a column.  (We need the relkind
+		 * test because indexes can also have auto dependencies on columns.)
+		 */
+		if (deprec->classid == RelationRelationId &&
+			deprec->objsubid == 0 &&
+			(deprec->deptype == DEPENDENCY_AUTO ||
+				deprec->deptype == DEPENDENCY_INTERNAL) &&
+			get_rel_relkind(deprec->objid) == RELKIND_SEQUENCE)
+		{
+			sequenceId = deprec->objid;
+			break;
+		}
+	}
+
+	systable_endscan(scan);
+	table_close(depRel, AccessShareLock);
+	return sequenceId;
+}
+
+static Datum
+versioning_update_plain(TriggerData* trigdata,
+						int period_attnum,
+						const char* period_attname,
+						const char* history_relation_argument)
+{
+	HeapTuple	tuple = trigdata->tg_trigtuple;
+	Relation	relation = trigdata->tg_relation;
+	Datum rel;
+	Oid o;
+	int			colnum[1] = { period_attnum };
+	Datum		values[1];
+	bool		nulls[1] = { false };
+	bool		period_changed = bms_is_member(period_attnum - FirstLowInvalidHeapAttributeNumber, trigdata->tg_updatedcols);
+	int			num = bms_num_members(trigdata->tg_updatedcols);
+
+	if (num > (int)period_changed)
+		insert_history_row(tuple, relation, history_relation_argument,
+			period_attname);
+	if (period_changed)
+		return PointerGetDatum(trigdata->tg_newtuple);
+
+	rel = DirectFunctionCall1(regclassout, ObjectIdGetDatum(relation->rd_rel->oid));
+	//sequence = DirectFunctionCall2(pg_get_serial_sequence, rel, CStringGetDatum(period_attname)); // <- locks :(
+	//values[0] = DirectFunctionCall1(nextval, sequence);
+	o = find_seq(relation, period_attnum);
+	if (o)
+		values[0] = Int64GetDatum(nextval_internal(o, false));
+	else {
+		values[0] = find_def(relation, period_attnum);
+		// try to get default
+	}
+	//sequence = DirectFunctionCall1(regclassin, CStringGetDatum("public.plain_version_version_seq"));
+	//values[0] = Int64GetDatum(nextval_internal(DatumGetObjectId(sequence), false));
+	//values[0] = DirectFunctionCall1(nextval, sequence);
+
+	return PointerGetDatum(heap_modify_tuple_by_cols(trigdata->tg_newtuple, RelationGetDescr(relation), 1, colnum, values, nulls));
+}
+
 /*
  * Insert the original row into the history table with the system period
  * attribute value "[lower, system_time)".
@@ -1019,20 +1159,24 @@ versioning_delete(TriggerData *trigdata,
 
 	relation = trigdata->tg_relation;
 
-	deserialize_system_period(tuple, relation, period_attnum, period_attname,
-							  typcache, &lower, &upper);
+	if (typcache->typtype == TYPTYPE_RANGE) {
+		deserialize_system_period(tuple, relation, period_attnum, period_attname,
+								  typcache, &lower, &upper);
 
-	/* Construct a period for the history row. */
-	upper.val = TimestampTzGetDatum(get_system_time());
-	upper.infinite = false;
-	upper.inclusive = false;
+		/* Construct a period for the history row. */
+		upper.val = TimestampTzGetDatum(get_system_time());
+		upper.infinite = false;
+		upper.inclusive = false;
 
-	/* Adjust if needed. */
-	adjust_system_period(typcache, &lower, &upper, adjust_argument, relation);
+		/* Adjust if needed. */
+		adjust_system_period(typcache, &lower, &upper, adjust_argument, relation);
 
-	range = make_range(typcache, &lower, &upper, false);
+		range = make_range(typcache, &lower, &upper, false);
 
-	history_tuple = modify_tuple(relation, tuple, period_attnum, range);
+		history_tuple = modify_tuple(relation, tuple, period_attnum, range);
+	}
+	else
+		history_tuple = tuple;
 
 	insert_history_row(history_tuple, relation, history_relation_argument,
 					   period_attname);

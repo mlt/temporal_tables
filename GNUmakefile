@@ -14,7 +14,7 @@ DOCS = README.md
 
 REGRESS = install no_system_period invalid_system_period \
           no_history_table no_history_system_period invalid_types \
-          invalid_system_period_values \
+          invalid_system_period_values plain_version \
           versioning versioning_custom_system_time combinations \
           structure uninstall
 

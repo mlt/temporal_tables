@@ -8,12 +8,12 @@ environment:
   PGUSER: postgres
   PGPASSWORD: Password12!
   matrix:
-  - pg: 12.0-1
-    PlatformToolset: v141
+  - pg: 12.3-2
+    PlatformToolset: v140
   - pg: master
     PlatformToolset: v141
     configuration: Debug
-  - pg: 11.5-2
+  - pg: 11.8-2
     PlatformToolset: v140
 matrix:
   allow_failures:
@@ -45,6 +45,7 @@ install:
         & ".\$env:exe" --unattendedmodeui none --mode unattended --superpassword "$env:PGPASSWORD" --servicepassword "$env:PGPASSWORD" | Out-Null
         Stop-Service "postgresql-x64-$env:pgversion"
       }
+      & dumpbin /imports $env:pgroot\bin\postgres.exe | findstr /i vcruntime | Write-Output "Linked runtime: $_"
     }
 
 cache:
@@ -90,6 +91,7 @@ test_script:
       pg_regress "--bindir=$env:pgroot\bin" --dbname=pl_regression `
              install no_system_period invalid_system_period no_history_table `
              no_history_system_period invalid_types invalid_system_period_values `
+             plain_version `
              versioning versioning_custom_system_time structure uninstall 2>&1 |
         %{ if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { $_ } } |
           Out-Default
