@@ -8,6 +8,8 @@ environment:
   PGUSER: postgres
   PGPASSWORD: Password12!
   matrix:
+  - pg: REL_13_STABLE
+    PlatformToolset: v140
   - pg: 12.3-2
     PlatformToolset: v140
   - pg: master
