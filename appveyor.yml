@@ -47,7 +47,11 @@ install:
         & ".\$env:exe" --unattendedmodeui none --mode unattended --superpassword "$env:PGPASSWORD" --servicepassword "$env:PGPASSWORD" | Out-Null
         Stop-Service "postgresql-x64-$env:pgversion"
       }
-      & dumpbin /imports $env:pgroot\bin\postgres.exe | findstr /i vcruntime | Write-Output "Linked runtime: $_"
+      & "C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\bin\amd64\dumpbin.exe" `
+        /dependents $env:pgroot\bin\postgres.exe | ?{$_ -match "vcruntime(\d+)"} | %{Write-Output "Linked runtime: $_"}
+      if ($env:PlatformToolset -notmatch $Matches[1]) {
+        Write-Output "Platform toolset mismatch!"
+      }
     }
 
 cache:
