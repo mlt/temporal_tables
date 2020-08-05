@@ -10,13 +10,9 @@ environment:
   matrix:
   - pg: REL_13_STABLE
     PlatformToolset: v140
-  - pg: 12.3-2
-    PlatformToolset: v140
   - pg: master
     PlatformToolset: v141
     configuration: Debug
-  - pg: 11.8-2
-    PlatformToolset: v140
 matrix:
   allow_failures:
     - pg: master
